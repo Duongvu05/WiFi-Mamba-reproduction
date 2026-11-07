@@ -322,6 +322,7 @@ def main():
     ap.add_argument("--guard", type=int, default=8)
     ap.add_argument("--seed", type=int, default=3)
     ap.add_argument("--max-steps", type=int, default=0, help="debug, limit steps per epoch")
+    ap.add_argument("--resume", type=Path, default=None, help="a <tag>_last.pt written at the end of every epoch, the run continues after its epoch with the same arguments")
     ap.add_argument("--cache", type=Path, default=ROOT / "outputs/piw3d_cache.npz", help="from build_cache.py")
     ap.add_argument("--out-dir", type=Path, default=ROOT / "outputs/wifimamba")
     a = ap.parse_args()
@@ -415,7 +416,36 @@ def main():
         sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, a.epochs, eta_min=1e-6)
     print(f"params={n_params:,} share={cfg.share_weights} streams={a.streams} lr={a.lr}", flush=True)
     best, bad, t0, ckpt = float("inf"), 0, time.time(), out / f"{a.tag}.pt"
-    for ep in range(1, a.epochs + 1):
+    last, start_ep = out / f"{a.tag}_last.pt", 1
+
+    def save_last(ep):
+        """Everything needed to continue: weights, AdamW moments, scheduler, epoch, selection state and the random generators. Written atomically."""
+        state = dict(model=model.state_dict(), opt_state=[{k: (v.detach().clone() if torch.is_tensor(v) else v) for k, v in opt.state[q].items()} for q in model.parameters()],
+                     sched=None if sched is None else sched.state_dict(), epoch=ep, best=best, bad=bad, rng=rng.bit_generator.state,
+                     torch_rng=torch.get_rng_state(), cuda_rng=torch.cuda.get_rng_state(), mean=mean_np, std=std_np, cfg=cfg.__dict__, args=vars(a) | {"out_dir": str(a.out_dir)})
+        tmp = last.with_suffix(".tmp")
+        torch.save(state, tmp)
+        tmp.replace(last)
+
+    if a.resume:
+        r = torch.load(a.resume, map_location=dev, weights_only=False)
+        model.load_state_dict(r["model"])  # copies into the existing tensors, so a captured CUDA graph stays valid
+        with torch.no_grad():
+            for q, st in zip(model.parameters(), r["opt_state"]):
+                for k, v in st.items():
+                    cur = opt.state[q].get(k)
+                    if torch.is_tensor(cur) and torch.is_tensor(v):
+                        cur.copy_(v)  # in place for the graph captured AdamW
+                    else:
+                        opt.state[q][k] = v.clone() if torch.is_tensor(v) else v
+        if sched is not None and r["sched"] is not None:
+            sched.load_state_dict(r["sched"])
+        start_ep, best, bad = r["epoch"] + 1, r["best"], r["bad"]
+        rng.bit_generator.state = r["rng"]
+        torch.set_rng_state(r["torch_rng"].cpu())
+        torch.cuda.set_rng_state(r["cuda_rng"].cpu())
+        print(f"resumed from {a.resume} after epoch {r['epoch']}, best {best:.2f}, bad {bad}", flush=True)
+    for ep in range(start_ep, a.epochs + 1):
         model.train()
         plans = segment_plans(fit_runs, a.segment, a.streams, rng) if a.segment else [plan_streams(fit_runs, a.streams, rng)]
         tot, steps = 0., 0
@@ -455,6 +485,7 @@ def main():
                 sched.step()
         if a.no_val:
             torch.save(dict(model=model.state_dict(), mean=mean_np, std=std_np, epoch=ep, cfg=cfg.__dict__, args=vars(a) | {"out_dir": str(a.out_dir)}), ckpt)
+            save_last(ep)
             print(f"epoch={ep} loss={float(tot) / steps:.4f} sec={time.time() - t0:.0f}", flush=True)
             continue
         P, L, C = predict(model, data["train"], val_runs, 128, dev, mean, std, len(y))
@@ -466,6 +497,7 @@ def main():
         else:
             bad += 1
         val_mm = [None if vm[f"n{n}"]["mpjpe_mm"] is None else round(vm[f"n{n}"]["mpjpe_mm"], 1) for n in (1, 2, 3)]
+        save_last(ep)
         print(f"epoch={ep} loss={float(tot) / steps:.4f} val_mpjpe={val_mm} sel={score:.2f} best={best:.2f} bad={bad} sec={time.time() - t0:.0f}", flush=True)
         if bad >= a.patience:
             break

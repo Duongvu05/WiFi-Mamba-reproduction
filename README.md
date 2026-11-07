@@ -51,6 +51,8 @@ python train.py --tag paper_b16 --preset paper --tokens packet --streams 16 --lr
 
 `--preset paper` sets the conv S6 of Eq. (6) to (8), unshared layers, the DWT with 2 levels on the raw amplitude and no residual around DS3M. `--s6 mamba` swaps in the standard Mamba block and `--tokens link` uses 180 tokens, one per link and packet. With `--tokens link` the SSMs scan the 180 tokens link-major, so their state crosses the boundary between two links. The baseline keeps the persistent memory of the paper (Eq. 18 to 20). Every SSA layer of the decoder has 16 learned memory tokens and a memory SSM whose state is carried from frame t-1 to frame t inside a run of consecutive frames and reset at the start of a run, in training and at test time. The paper does not say whether the gradient flows back through earlier frames. Here the carried state is detached after every frame, so the gradient stays inside the current frame. `--no-memory` resets the state at every frame (an ablation), in the eager and in the `--graph` training step.
 
+At the end of every epoch `<out-dir>/<tag>_last.pt` keeps the weights, the AdamW moments, the scheduler, the epoch, the selection state and the random generators. To continue an interrupted run, repeat the same command with `--resume <out-dir>/<tag>_last.pt`.
+
 The checkpoint is selected on held-out runs of the train split (`--val-frac`, with a guard of `--guard` frames around them), never on the test split. `--graph` captures the training step in a CUDA graph. Without it the same step runs eagerly.
 
 ## Evaluation
