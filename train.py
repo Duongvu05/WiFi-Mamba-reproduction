@@ -244,7 +244,7 @@ class GraphStep:
     def _load(self, col, reset_col):
         self.idx.copy_(col.clamp(min=0))
         self.valid.copy_((col >= 0).float())
-        self.keep.copy_((~reset_col).float()[:, None, None])
+        self.keep.copy_((~reset_col).float()[:, None, None] * (0.0 if NO_MEMORY else 1.0))  # --no-memory zeroes the input state at every frame, as run_stream does
 
     def replay(self, col, reset_col):
         self._load(col, reset_col)
@@ -272,8 +272,9 @@ def predict(model, data, runs, n_streams, device, mean, std, n_frames):
 
 
 def selection_score(m):
+    """Mean over the person counts present in the validation frames of (summed matched MPJPE + 1000 per missed or extra person) per person."""
     return float(np.mean([((v["mpjpe_mm"] or 0.) * v["matched"] + 1000. * (v["missed"] + v["extra"])) / (v["frames"] * n)
-                          for n, v in ((n, m[f"n{n}"]) for n in (1, 2, 3))]))
+                          for n, v in ((n, m[f"n{n}"]) for n in (1, 2, 3)) if v["frames"]]))
 
 
 def main():
@@ -464,7 +465,8 @@ def main():
             torch.save(dict(model=model.state_dict(), mean=mean_np, std=std_np, epoch=ep, cfg=cfg.__dict__, args=vars(a) | {"out_dir": str(a.out_dir)}, validation=vm), ckpt)
         else:
             bad += 1
-        print(f"epoch={ep} loss={float(tot) / steps:.4f} val_mpjpe={[round(vm[f'n{n}']['mpjpe_mm'], 1) for n in (1, 2, 3)]} sel={score:.2f} best={best:.2f} bad={bad} sec={time.time() - t0:.0f}", flush=True)
+        val_mm = [None if vm[f"n{n}"]["mpjpe_mm"] is None else round(vm[f"n{n}"]["mpjpe_mm"], 1) for n in (1, 2, 3)]
+        print(f"epoch={ep} loss={float(tot) / steps:.4f} val_mpjpe={val_mm} sel={score:.2f} best={best:.2f} bad={bad} sec={time.time() - t0:.0f}", flush=True)
         if bad >= a.patience:
             break
     saved = torch.load(ckpt, weights_only=False)

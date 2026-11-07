@@ -52,8 +52,10 @@ def main():
     ap.add_argument("--persons", type=int, default=0, help="only the frames with this number of persons, for a checkpoint trained with --persons")
     a = ap.parse_args()
     dev = torch.device("cuda")
-    e.NO_MEMORY, e.ORDERED, e.PHASE_SCALE, e.MATCH_SCALE, e.MATCH_PHYSICAL = False, False, 1.0, 42.0, False
     ck = torch.load(a.ckpt, weights_only=False, map_location="cpu")
+    args = ck.get("args", {})  # the inference switches of the training run (diagnostics such as --no-memory change the forward)
+    e.NO_MEMORY, e.ORDERED = bool(args.get("no_memory", False)), bool(args.get("ordered", False))
+    e.PHASE_SCALE = 0.0 if args.get("phase", "raw") == "none" else 1.0
     cfg = FaithfulConfig(**{k: v for k, v in ck["cfg"].items() if k in FaithfulConfig.__dataclass_fields__})
     model = WiFiMamba(cfg).to(dev)
     model.load_state_dict(ck["model"])
@@ -72,11 +74,12 @@ def main():
     P, L, C = e.predict(model, data, runs, 128, dev, mean, std, len(y))
     if sel is not None:
         P, L, C, y, mask = P[sel], L[sel], C[sel], y[sel], mask[sel]
-    print(f"checkpoint {a.ckpt} epoch {ck['epoch']} split {sp} frames {len(y)} queries {P.shape[1]} parameters {sum(p.numel() for p in model.parameters()):,}")
+    print(f"checkpoint {a.ckpt} epoch {ck['epoch']} split {sp} frames {len(y)} queries {P.shape[1]} parameters {sum(p.numel() for p in model.parameters()):,} memory {'off' if e.NO_MEMORY else 'on'}")
+    print("pose errors on the matched pairs only, PCK normalised by the elbow to elbow distance, recall and precision count a pair with MPJPE <= 500 mm as a true positive")
     out = {"epoch": int(ck["epoch"])}
     rows = (("1 predicted count (no labels)", full_metrics(P, L, C, y, mask)), ("3 true count, top-n by confidence", full_metrics(P, L, mask.sum(1).astype(int), y, mask)))
     g = greedy_present(P, y, mask)
-    keys = ("mpjpe_mm", "pa_mpjpe_mm", "mpjdle_h_mm", "mpjdle_v_mm", "mpjdle_d_mm", "pck30", "pck20", "pck10", "count_acc")
+    keys = ("mpjpe_mm", "pa_mpjpe_mm", "mpjdle_h_mm", "mpjdle_v_mm", "mpjdle_d_mm", "pck30", "pck20", "pck10", "count_acc", "pair_recall", "pair_precision", "recall", "precision")
     for name, r in rows[:1]:
         print(f"--- {name}")
         for k in keys:

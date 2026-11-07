@@ -14,18 +14,20 @@ BONES = ((0, 1), (1, 2), (1, 3), (2, 4), (4, 8), (3, 6), (6, 10), (1, 5), (1, 7)
 
 
 def compute_similarity_transform(source, target):
-    """Procrustes alignment (scale, rotation, translation) of source onto target. [J, 3]."""
+    """Least squares similarity alignment (scale, rotation, translation) of source onto target, [J, 3] (Umeyama).
+    With X, Y the centred poses and R the optimal rotation, the optimal scale is s = <X R, Y> / |X|_F^2."""
     mu_s, mu_t = source.mean(axis=0, keepdims=True), target.mean(axis=0, keepdims=True)
     s0, t0 = source - mu_s, target - mu_t
-    if (s0 ** 2).sum() < 1e-8:
+    norm = (s0 ** 2).sum()
+    if norm < 1e-8:
         return source
     u, _, vt = np.linalg.svd(s0.T @ t0)
     r = u @ vt
-    if np.linalg.det(r) < 0:
+    if np.linalg.det(r) < 0:  # a reflection, flip the axis of the smallest singular value
         vt[-1] *= -1
         r = u @ vt
-    scale = np.linalg.norm(t0) / (np.linalg.norm(s0 @ r) + 1e-8)
-    return scale * (source - mu_s) @ r + mu_t
+    scale = float(((s0 @ r) * t0).sum() / norm)
+    return scale * s0 @ r + mu_t
 
 
 def hungarian_pairs(gt, pred_sel):
@@ -36,13 +38,14 @@ def hungarian_pairs(gt, pred_sel):
 
 
 def person_metrics(gt_p, pred_p):
-    """Per-person metrics in mm. Returns (normalised distance per joint, (MPJPE, PA-MPJPE, h, v, d) in mm)."""
+    """Per-person metrics in mm. Returns (normalised distance per joint, (MPJPE, PA-MPJPE, h, v, d) in mm).
+    The PCK normaliser is the distance between the two elbows of the ground truth (joints 4 and 6 of the label order), not a torso length."""
     gt_p, pred_p = gt_p * 1000.0, pred_p * 1000.0
-    torso = np.linalg.norm(gt_p[6] - gt_p[4])
+    elbows = np.linalg.norm(gt_p[6] - gt_p[4])
     dist = np.linalg.norm(pred_p - gt_p, axis=-1)
     pa = np.linalg.norm(compute_similarity_transform(pred_p, gt_p) - gt_p, axis=-1)
     mm = (dist.mean(), pa.mean(), np.abs(pred_p[:, 0] - gt_p[:, 0]).mean(), np.abs(pred_p[:, 1] - gt_p[:, 1]).mean(), np.abs(pred_p[:, 2] - gt_p[:, 2]).mean())
-    return dist / torso, mm
+    return dist / elbows, mm
 
 
 def select_and_match(pred, logits, n_hat, y, mask):
@@ -76,6 +79,10 @@ def metrics(pred, logits, counts, y, masks):
                 centered_sq.extend(np.sum((delta - shift[:, None]) ** 2, axis=-1).mean(-1).tolist())
                 joint_sq.extend(np.sum(delta ** 2, axis=-1).mean(-1).tolist())
                 matched += len(a)
+        if not len(rows):  # no frame with n persons (a subset or a one-scenario model)
+            result[f"n{n}"] = dict(mpjpe_mm=None, frames=0, matched=0, missed=0, extra=0, recall=None, precision=None, count_accuracy=None,
+                                   centroid_rmse_mm=None, centered_pose_rmse_mm=None, centroid_squared_error_fraction=None)
+            continue
         result[f"n{n}"] = dict(
             mpjpe_mm=float(np.mean(errors) * 1000) if errors else None, frames=len(rows), matched=matched,
             missed=len(rows) * n - matched, extra=total - matched, recall=matched / (len(rows) * n),
@@ -86,11 +93,15 @@ def metrics(pred, logits, counts, y, masks):
     return result
 
 
-def full_metrics(pred, logits, n_hat, y, mask):
-    """MPJPE, PA-MPJPE, MPJDLE (h, v, d), PCK@30/20/10 and count/recall/precision per person count."""
+def full_metrics(pred, logits, n_hat, y, mask, tp_mm=500.0):
+    """Per person count n.
+    Pose error on the matched pairs only: MPJPE, PA-MPJPE, MPJDLE (h, v, d) in mm, PCK@30/20/10 (the share of joints closer than
+    0.3, 0.2, 0.1 times the elbow to elbow distance of the ground truth).
+    Counting and detection, kept apart from the pose error: count_acc (the kept number of persons equals n), pair_recall and pair_precision
+    (every Hungarian pair counts, however far), and recall and precision where a pair is a true positive only if its MPJPE is at most tp_mm."""
     out = {}
     for n in (1, 2, 3):
-        mm, dn, matched, n_pred = [], [], 0, 0
+        mm, dn, matched, n_pred, tp = [], [], 0, 0, 0
         idx = np.flatnonzero(mask.sum(1).astype(int) == n)
         for nn_, i, pairs, ps, m in select_and_match(pred, logits, n_hat, y, mask):
             if nn_ != n:
@@ -101,9 +112,13 @@ def full_metrics(pred, logits, n_hat, y, mask):
                 d, r = person_metrics(y[i, g], ps[p])
                 mm.append(r)
                 dn.append(d)
+                tp += int(r[0] <= tp_mm)
         o = dict(samples=int(len(idx)))
+        if not len(idx):  # no frame with n persons
+            out[f"n{n}"] = o | dict(mpjpe_mm=None, count_acc=None, pair_recall=None, pair_precision=None, recall=None, precision=None)
+            continue
         if not mm:  # every person missed
-            out[f"n{n}"] = o | dict(mpjpe_mm=None, count_acc=round(100 * float((n_hat[idx] == n).mean()), 2), recall=0.0, precision=0.0)
+            out[f"n{n}"] = o | dict(mpjpe_mm=None, count_acc=round(100 * float((n_hat[idx] == n).mean()), 2), pair_recall=0.0, pair_precision=0.0, recall=0.0, precision=0.0)
             continue
         mm, dn = np.array(mm), np.concatenate(dn)
         for k, name in enumerate(("mpjpe_mm", "pa_mpjpe_mm", "mpjdle_h_mm", "mpjdle_v_mm", "mpjdle_d_mm")):
@@ -111,8 +126,11 @@ def full_metrics(pred, logits, n_hat, y, mask):
         for t, name in ((0.3, "pck30"), (0.2, "pck20"), (0.1, "pck10")):
             o[name] = round(100 * float((dn <= t).mean()), 2)
         o["count_acc"] = round(100 * float((n_hat[idx] == n).mean()), 2)
-        o["recall"] = round(100 * matched / (len(idx) * n), 2)
-        o["precision"] = round(100 * matched / max(n_pred, 1), 2)
+        o["pair_recall"] = round(100 * matched / (len(idx) * n), 2)
+        o["pair_precision"] = round(100 * matched / max(n_pred, 1), 2)
+        o["recall"] = round(100 * tp / (len(idx) * n), 2)
+        o["precision"] = round(100 * tp / max(n_pred, 1), 2)
+        o["tp_mm"] = tp_mm
         out[f"n{n}"] = o
     return out
 
